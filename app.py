@@ -5,143 +5,210 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, error
 from PIL import Image
 from collections import defaultdict
+from datetime import datetime
 from tkinter import Tk, filedialog
 
-MAX_SIZE = 400  # maximum album cover size (px)
+# --- Configuration ---
+MAX_SIZE = 400  # Target size for album art (px)
+SUPPORTED_EXTENSIONS = ('.mp3',)
+ENABLE_LOGGING = True  # Set to False to disable logfile generation
 
-def download_album_art(artist, title, size=600):
-    # Download album cover from iTunes API
-    query = f"{artist} {title}"
-    url = "https://itunes.apple.com/search"
-    params = {"term": query, "media": "music", "limit": 1}
-    resp = requests.get(url, params=params)
-
-    if resp.status_code != 200:
-        print("❌ Failed to connect to iTunes API")
-        return None
-
-    results = resp.json().get("results")
-    if not results:
-        print("⚠️ No results found on iTunes")
-        return None
-
-    art_url = results[0].get("artworkUrl100")
-    if not art_url:
-        print("⚠️ No artwork URL found")
-        return None
-
-    # Request higher resolution (100x100 → 600x600)
-    art_url = art_url.replace("100x100", f"{size}x{size}")
-
-    print(f"⬇️ Downloading artwork: {art_url}")
-    img_data = requests.get(art_url).content
-    return img_data
-
-def resize_image(data):
-    # Resize the image if it's larger than MAX_SIZE
-    with Image.open(io.BytesIO(data)) as img:
-        img = img.convert("RGB")
-        if max(img.size) <= MAX_SIZE:
-            print("📏 Image already within acceptable size, skipping resize.")
-            return data
-        img.thumbnail((MAX_SIZE, MAX_SIZE))
-        out = io.BytesIO()
-        img.save(out, format="JPEG")
-        return out.getvalue()
-
-def process_mp3(filepath):
+# --- Function to download album art from iTunes API ---
+def download_album_art(artist: str, title: str, size: int = 600):
+    """Fetch album art from iTunes API based on artist and title."""
     try:
-        audio = MP3(filepath, ID3=ID3)
-        tags = ID3(filepath)
-        apic_tags = [tag for key, tag in tags.items() if key.startswith("APIC")]
+        query = f"{artist} {title}".replace(' ', '+')
+        url = f"https://itunes.apple.com/search?term={query}&limit=1"
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        if data['resultCount'] > 0:
+            artwork_url = data['results'][0]['artworkUrl100'].replace('100x100', f'{size}x{size}')
+            return requests.get(artwork_url, timeout=5).content
+    except Exception:
+        pass
+    return None
 
-        if apic_tags:
-            print("🎨 Album cover found, resizing...")
-            art = apic_tags[0].data
-            resized = resize_image(art)
-            status = "resized"
-        else:
-            print("⚠️ No album cover found, downloading...")
-            artist = tags.get("TPE1")
-            title = tags.get("TIT2")
-            if not artist or not title:
-                print("⚠️ Missing artist or title tag — cannot search for artwork")
-                return "skipped"
+# --- Resize an image to exactly 400x400 px (preserving aspect ratio with padding) ---
+def resize_to_400(image_bytes: bytes) -> bytes:
+    """Resize image to 400x400 px with padding if needed."""
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        img = img.convert("RGB")
+        img.thumbnail((MAX_SIZE, MAX_SIZE))
+        new_img = Image.new("RGB", (MAX_SIZE, MAX_SIZE), (0, 0, 0))
+        x = (MAX_SIZE - img.width) // 2
+        y = (MAX_SIZE - img.height) // 2
+        new_img.paste(img, (x, y))
+        output = io.BytesIO()
+        new_img.save(output, format='JPEG')
+        return output.getvalue()
 
-            art = download_album_art(str(artist), str(title))
-            if not art:
-                print("⚠️ Could not find album artwork")
-                return "missing"
+# --- Extract current embedded album art (if exists) ---
+def get_embedded_art(file_path: str):
+    """Return the embedded album art as bytes if it exists."""
+    audio = MP3(file_path, ID3=ID3)
+    for tag in audio.tags.values():
+        if isinstance(tag, APIC):
+            return tag.data
+    return None
 
-            resized = resize_image(art)
-            status = "added"
+# --- Embed album art into MP3 ---
+def embed_album_art(file_path: str, image_bytes: bytes):
+    """Embed or replace album art in MP3 file."""
+    try:
+        audio = MP3(file_path, ID3=ID3)
+        try:
+            audio.add_tags()
+        except error:
+            pass
 
-        tags.delall("APIC")
-        tags.add(APIC(
-            encoding=3,
-            mime="image/jpeg",
-            type=3,
-            desc="Cover",
-            data=resized
-        ))
-        tags.save(v2_version=3)
-        print(f"✅ Album art saved ({status})")
-        return status
+        # Remove old APIC tags (to replace existing image)
+        audio.tags.delall("APIC")
 
-    except error as e:
-        print(f"❌ Error: {e}")
-        return "skipped"
+        # Add resized image
+        resized = resize_to_400(image_bytes)
+        audio.tags.add(APIC(encoding=3, mime='image/jpeg', type=3, desc='Cover', data=resized))
+        audio.save()
+    except Exception as e:
+        print(f"⚠️ Failed to embed art for {os.path.basename(file_path)}: {e}")
 
-def main():
-    # Select folder
-    root = Tk()
-    root.withdraw()
-    folder = filedialog.askdirectory(title="Select the folder containing your music files")
-    if not folder:
-        print("🚫 No folder selected, exiting.")
+# --- Extract artist and title from filename ---
+def extract_metadata_from_filename(filename: str):
+    """Extract artist and title from filename pattern 'Artist - Title.mp3'."""
+    name = os.path.splitext(os.path.basename(filename))[0]
+    if ' - ' in name:
+        artist, title = name.split(' - ', 1)
+        return artist.strip(), title.strip()
+    return None, None
+
+# --- Check image size ---
+def get_image_size(image_bytes: bytes):
+    """Return (width, height) of an image."""
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            return img.width, img.height
+    except Exception:
+        return None, None
+
+# --- Save log file if enabled ---
+def save_log(folder_path: str, log_lines: list[str]):
+    """Save log entries to a file if ENABLE_LOGGING is True."""
+    if not ENABLE_LOGGING:
         return
+    try:
+        log_path = os.path.join(folder_path, "album_art_log.txt")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("\n--- Run at: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " ---\n")
+            for line in log_lines:
+                f.write(line + "\n")
+        print(f"📝 Log saved: {log_path}")
+    except Exception as e:
+        print(f"⚠️ Failed to save log: {e}")
 
-    print(f"📁 Selected folder: {folder}")
-    format_counter = defaultdict(int)
+# --- Main folder processing ---
+def process_folder(folder_path: str):
+    """Process all MP3 files in the folder and fix album art."""
+    stats = defaultdict(int)
+    log_lines = []
 
-    # Statistics containers
-    stats = {"resized": [], "added": [], "missing": [], "skipped": []}
+    for root, _, files in os.walk(folder_path):
+        for file in files:
+            if not file.lower().endswith(SUPPORTED_EXTENSIONS):
+                continue
 
-    # Recursively walk through files
-    for dirpath, _, filenames in os.walk(folder):
-        for filename in filenames:
-            ext = os.path.splitext(filename)[1].lower()
-            format_counter[ext] += 1
+            full_path = os.path.join(root, file)
+            stats["total_checked"] += 1
+            artist, title = extract_metadata_from_filename(file)
 
-            if ext == ".mp3":
-                filepath = os.path.join(dirpath, filename)
-                print(f"\n🎵 Processing: {filepath}")
-                status = process_mp3(filepath)
-                if status:
-                    stats[status].append(filepath)
+            if not artist or not title:
+                msg = f"⚠️ Skipping (invalid name): {file}"
+                print(msg)
+                log_lines.append(msg)
+                stats["invalid_name"] += 1
+                continue
 
-    # File type statistics
-    print("\n📊 File type statistics:")
-    for ext, count in sorted(format_counter.items(), key=lambda x: x[1], reverse=True):
-        print(f"  {ext or 'No extension'}: {count} file(s)")
+            current_art = get_embedded_art(full_path)
 
-    # Processing statistics
-    print("\n📊 Processing results:")
-    print(f"  Resized covers: {len(stats['resized'])}")
-    print(f"  Added covers: {len(stats['added'])}")
-    print(f"  Failed (no results): {len(stats['missing'])}")
-    print(f"  Skipped (missing tags / error): {len(stats['skipped'])}")
+            # --- Case 1: File already has album art ---
+            if current_art:
+                stats["has_art"] += 1
+                width, height = get_image_size(current_art)
 
-    # Detailed lists
-    if stats["missing"]:
-        print("\n❌ No album cover found for these files:")
-        for f in stats["missing"]:
-            print(f"   {f}")
+                if width is None or height is None:
+                    msg = f"⚠️ Corrupted art in: {file}"
+                    print(msg)
+                    log_lines.append(msg)
+                    stats["corrupted_art"] += 1
+                    continue
 
-    if stats["skipped"]:
-        print("\n⚠️ Skipped files:")
-        for f in stats["skipped"]:
-            print(f"   {f}")
+                if width == MAX_SIZE and height == MAX_SIZE:
+                    msg = f"✅ Already correct size: {file}"
+                    print(msg)
+                    log_lines.append(msg)
+                    continue
+                elif width < MAX_SIZE or height < MAX_SIZE:
+                    msg = f"🖼 Too small, replacing with iTunes art: {file}"
+                    print(msg)
+                    log_lines.append(msg)
+                    new_art = download_album_art(artist, title)
+                    if new_art:
+                        embed_album_art(full_path, new_art)
+                        stats["replaced_small"] += 1
+                    else:
+                        msg = f"❌ Could not download art for: {file}"
+                        print(msg)
+                        log_lines.append(msg)
+                        stats["download_failed"] += 1
+                else:
+                    msg = f"🔧 Resizing large art: {file} ({width}x{height})"
+                    print(msg)
+                    log_lines.append(msg)
+                    embed_album_art(full_path, current_art)
+                    stats["resized"] += 1
+
+            # --- Case 2: No album art present ---
+            else:
+                msg = f"🎵 No album art found, downloading for: {artist} - {title}"
+                print(msg)
+                log_lines.append(msg)
+                new_art = download_album_art(artist, title)
+                if new_art:
+                    embed_album_art(full_path, new_art)
+                    stats["added_missing"] += 1
+                else:
+                    msg = f"❌ No album art found online for: {file}"
+                    print(msg)
+                    log_lines.append(msg)
+                    stats["download_failed"] += 1
+
+    # --- Print and log statistics ---
+    summary_lines = [
+        "",
+        "--- Summary ---",
+        f"🎧 Total MP3 files checked: {stats['total_checked']}",
+        f"🖼 Already had album art: {stats['has_art']}",
+        f"🔧 Resized (too large): {stats['resized']}",
+        f"🪄 Replaced small art: {stats['replaced_small']}",
+        f"🎨 Added missing art: {stats['added_missing']}",
+        f"⚠️ Invalid names skipped: {stats['invalid_name']}",
+        f"❌ Downloads failed: {stats['download_failed']}",
+        f"💾 Corrupted images: {stats['corrupted_art']}"
+    ]
+
+    print("\n".join(summary_lines))
+    log_lines.extend(summary_lines)
+
+    if ENABLE_LOGGING:
+        save_log(folder_path, log_lines)
+
+# --- Main entry point ---
+def main():
+    """Open folder dialog and start the process."""
+    Tk().withdraw()
+    folder = filedialog.askdirectory(title="Select your music folder")
+    if folder:
+        process_folder(folder)
+    else:
+        print("❌ No folder selected.")
 
 if __name__ == "__main__":
     main()
